@@ -118,19 +118,3 @@ Selecting genes to use per iteration:
 For each iteration, the program randomly select genes to use (using 'sample' function).  
 Then, these gene are further filtered by using 1) ANOVA to filter out genes that show high intra-group variation ('group' here is the cell type) and 2) custom kappa function.    
 Finally, a support vector regression is used to impute the cell states and types per iteration using these randomly selected genes.
-
-```{r}
-
-createSpecificRef <- function(currRefference, modelSize, neighborhoodSize, genePercents, chosenCells, chosenNeigCells){
-  specificRef = do.call(cbind,lapply(chosenCells,function(chosenCell){
-    currRefference[,chosenNeigCells[[chosenCell]]]
-  }))
-  colnames(specificRef) = unlist(lapply(chosenCells,function(cell){
-    rep(paste(colnames(currRefference)[cell],cell,sep="_"),neighborhoodSize)
-  }))
-  row.names(specificRef) = row.names(currRefference)
-  specificRef = specificRef[sample(1:dim(currRefference)[1],round(genePercents*dim(currRefference)[1])),]
-  list(ref = specificRef, chosenCells = chosenCells)
-}
-
-```
