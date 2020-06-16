@@ -1,0 +1,136 @@
+---
+title: "Description of the scBio deconvolution method"
+output:
+  html_document:
+    df_print: paged
+---
+
+This is a personal document to demonstrate the key functions used in the paper with corresponding code snippets.    
+<https://www.nature.com/articles/s41592-019-0355-5>
+
+There are four main inputs that are required: 
+1) scRNA count matrix (reference)  
+2) a cell-state map derived from the scRNA data (e.g.tSNE/UMAP projection that has been pre-defined)  
+3) cell labels (reference cell labels. e.g. cell clusters (B cells, T cells, etc))  
+4) a bulk RNA-seq data it wants to deconvolve  
+
+This program runs multiple iterations and average the resulting values for a final decovolution result.  
+So the result is a map of relative abundance of cell states annd types imputed from the input bulk RNA-seq data.  
+Per iteration, this program samples random cells representing every cell clusters and states.
+The number of iterations and randomly selected cells per iteration are pre-computed before it runs support vector regression for actual deconvolution. 
+
+So the first step is to define the number of iterations and assign randomly selected cells per iteration.
+A main function that does this is **choseCellsForRuns()**
+
+It starts by firstly defining a grid.   
+An 'initialGrids' object is a 'list' object containing cells (names) sorted into 'k' number of bins per cell cluster
+
+```{r}
+#1. This is the first part of the choseCellsForRuns()
+
+initialGrids = lapply(unique(SCLabels), function(currCluster){
+  clusterIndexes = which(SCLabels==currCluster)
+  nbins = max(k,length(clusterIndexes)/neighborhoodSize)
+  
+  currXY = SCCellSpace[clusterIndexes,] # Dim1 and Dim2 values of a cell cluster
+  ch <- grDevices::chull(currXY) # Stores indices of a convex hull (x and y coordinates that enclose the geometric shape)
+  coords <- currXY[c(ch, ch[1]), ] # Coordinates of the indices
+   
+  poly = sp::SpatialPolygons(list(sp::Polygons(list(sp::Polygon(coords)), "x"))) # A polygon object
+  grid <- raster::raster(raster::extent(poly), nrows = ceiling(sqrt(nbins)), ncols= ceiling(sqrt(nbins))) # Extent function returns xmin, xmax, ymin, ymax (coordinates)
+  sp::proj4string(grid)<-sp::proj4string(poly) # Grid object has a grid with 3 X 3 dimension enclosed by the coordinates defined above 
+  cellLocationOnGrid = raster::cellFromXY(grid, currXY) 
+  # Assign cells within the cluster to this grid (Since it is a 3 X 3 grid, we are trying to sort the cells into 9 bins, but not necessarily filling all the 9 bins)
+  tab <- table(cellLocationOnGrid)
+  grid[as.numeric(names(tab))] <- tab
+  
+  list(grid = grid, clusterIndexes = clusterIndexes, cellLocationOnGrid = cellLocationOnGrid, nFullbins = length(tab), maxBinSize = max(tab))
+}) 
+# Sorting the cells into 'k' number of bins is important for the downstream process where we sample 'k' cells from these bins 
+# These ensures the program samples cells equally across the cell-state space
+
+numOfRuns = ceiling(minSelection*max(unlist(lapply(initialGrids,function(clusterData){ clusterData$nFullbins * clusterData$maxBinSize  }))) / k) 
+# Number of iterations depend on the a) the number of bins, b) the number of cells per bin, and c) the number of unique cell labels
+
+```
+
+The second step is to ramdoly sample from these grids per iteration  
+The goal here is to sample only one cell from each bin per cell label
+
+``` {r}
+#2. This is the second part of the choseCellsForRuns()
+
+meanDistMatrix = rep(1,length(refNames))
+chosenCellList = lapply(1:numOfRuns, function(runNum){
+  chosenCells = as.numeric(unlist(lapply(unique(refNames),function(currCluster){
+    initialGrid = initialGrids[[which(unique(refNames)==currCluster)]]
+    clusterIndexes = initialGrid$clusterIndexes
+    grid = initialGrid$grid
+    cellLocationOnGrid = initialGrid$cellLocationOnGrid
+    kToUse = k
+    if(k>length(which(!is.na(grid[])))){
+      kToUse = length(which(!is.na(grid[])))
+      }
+    gridCellsToUse = sample(which(!is.na(grid[])),kToUse,replace = F)
+    chosenCellsForCluster = clusterIndexes[unlist(lapply(gridCellsToUse, function(currCell){
+      chosenCell = which(cellLocationOnGrid==currCell)
+      if(length(chosenCell)>1){
+        chosenCell = sample(chosenCell,1,prob = meanDistMatrix[clusterIndexes[chosenCell]])
+        }
+      chosenCell
+      }))]
+    chosenCellsForCluster
+    })))
+  cellsToReduce = chosenCells[which(meanDistMatrix[chosenCells]>minValueToReduceTo)]
+  meanDistMatrix[cellsToReduce] <<- meanDistMatrix[cellsToReduce]/10
+  chosenCells
+  })
+
+```
+
+The last step of this function is to derive 10 most closely related cells for each cell.  
+For example, if there are 10 cell types and 10 bins representing the cell states within a cell type, then one iteration is comprised of 1000 cells.  
+
+```{r}
+#3. This is the last part of the choseCellsForRuns()
+
+chosenNeigList = lapply(1:length(SCLabels),function(cellIndex){ # Select one cell
+  selectedCellType = SCLabels[cellIndex]  
+  selectedCellIndexes = which(SCLabels == selectedCellType)
+  cellXY = SCCellSpace[cellIndex,] # Selected cell's Dim1 and Dim2 information
+  cellDist = fields::rdist(t(as.matrix(cellXY)),SCCellSpace[selectedCellIndexes,]) # Distance measure between the selected cell and other cells in the same cluster
+  chosenRepeats = order(as.numeric(cellDist),decreasing = F)[1:neighborhoodSize] # Top 10 similar cells
+  chosenRepeats = chosenRepeats[!is.na(chosenRepeats)]
+  selectedCellIndexes[chosenRepeats]
+})
+
+cellselection = list(chosenCellList = chosenCellList, chosenNeigList = chosenNeigList, numOfRuns = numOfRuns)
+
+# In the main function, it will use the sampled cells per cluster ( k * # of clusters / run) defined above and and 10 other similar cells (neighbor cells) per sampled cells
+# Also, sample reduced number of genes to use per iteration 
+
+```
+
+These randomly chosen cells per iteration are then used as inputs for support vector regression.  
+
+Selecting genes to use per iteration:  
+
+For each iteration, the program randomly select genes to use (using 'sample' function).  
+Then, these gene are further filtered by using 1) ANOVA to filter out genes that show high intra-group variation ('group' here is the cell type) and 2) custom kappa function.    
+Finally, a support vector regression is used to impute the cell states and types per iteration using these randomly selected genes.
+
+```{r}
+
+createSpecificRef <- function(currRefference, modelSize, neighborhoodSize, genePercents, chosenCells, chosenNeigCells){
+  specificRef = do.call(cbind,lapply(chosenCells,function(chosenCell){
+    currRefference[,chosenNeigCells[[chosenCell]]]
+  }))
+  colnames(specificRef) = unlist(lapply(chosenCells,function(cell){
+    rep(paste(colnames(currRefference)[cell],cell,sep="_"),neighborhoodSize)
+  }))
+  row.names(specificRef) = row.names(currRefference)
+  specificRef = specificRef[sample(1:dim(currRefference)[1],round(genePercents*dim(currRefference)[1])),]
+  list(ref = specificRef, chosenCells = chosenCells)
+}
+
+```
